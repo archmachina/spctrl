@@ -1,2 +1,3 @@
-# pysup
-Python Process Supervisor
+# spctrl
+Simple Process Controller
+

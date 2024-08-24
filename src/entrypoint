@@ -1,0 +1,6 @@
+#!/bin/bash
+
+exec python3 -m spctrl "$@"
+
+exit 1
+
