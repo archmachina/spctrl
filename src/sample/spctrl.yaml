@@ -1,0 +1,13 @@
+---
+
+vars:
+
+processes:
+  test:
+    command: test
+    dependencies:
+      - name: other
+
+  other:
+    command: other
+
