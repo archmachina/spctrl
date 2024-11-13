@@ -62,8 +62,11 @@ def main():
         logger.debug("Creating supervisor")
         supervisor = core.Supervisor(config_file)
 
-        logger.debug("Running supervisor")
-        supervisor.run()
+        logger.debug("Waiting on supervisor")
+        supervisor.wait()
+
+    except KeyboardInterrupt as e:
+        pass
 
     except BrokenPipeError as e:
         try:

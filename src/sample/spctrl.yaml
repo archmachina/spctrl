@@ -4,10 +4,12 @@ vars:
 
 processes:
   test:
-    command: test
+    command: "/bin/bash -c 'sleep 30' && echo finish test"
+    shell: true
     dependencies:
       - name: other
 
   other:
-    command: other
+    command: "/bin/bash -c 'sleep 15' && echo finish other"
+    shell: true
 

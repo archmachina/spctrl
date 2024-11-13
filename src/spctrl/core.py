@@ -7,6 +7,9 @@ import sys
 import copy
 import enum
 import time
+import threading
+import subprocess
+import shlex
 
 logger = logging.getLogger(__name__)
 
@@ -26,24 +29,91 @@ class SupervisorProcessDeps:
         self.strict = obslib.extract_property(definition, "strict", optional=True, default=False)
         self.strict = obslib.coerce_value(self.strict, bool)
 
+class SupervisorProcessExec:
+    def __init__(self, config, condition):
+        if not isinstance(config, SupervisorProcessConfig):
+            raise ValueError("Invalid SupervisorProcessConfig passed to SupervisorProcessExec")
+
+        if not isinstance(condition, threading.Condition):
+            raise ValueError("Invalid condition passed to SupervisorProcessExec")
+
+        self._config = config
+
+        # State variables indicating state for the process being called
+        self.finished = False
+        self.rc = None
+        self.proc = None
+
+        # Start the thread to execute the process
+        self._condition = condition
+        self._thread = threading.Thread(target=SupervisorProcessExec._exec, args=[self])
+        self._thread.start()
+
+    def _exec(self):
+
+        call = self._config.command
+        if not self._config.shell:
+            call = shlex.split(call)
+
+        # Run the command defined in the configuration and wait for the result
+        subprocess_args = {
+            "env": os.environ.copy(),
+            "stdout": None,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+            "text": True,
+            "shell": self._config.shell
+        }
+
+        proc = subprocess.Popen(call, **subprocess_args)
+
+        self.proc = proc
+        self.rc = proc.returncode
+        self.finished = True
+
+        self._condition.acquire()
+        self._condition.notify()
+        self._condition.release()
+
+    def terminate(self):
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(10)
+        proc.kill()
+
 class SupervisorProcessState:
-    def __init__(self, config):
+    def __init__(self, supervisor, config):
         if not isinstance(config, SupervisorProcessConfig):
             raise ValueError("Invalid SupervisorProcessConfig passed to SupervisorProcessState")
 
+        if not isinstance(supervisor, Supervisor):
+            raise ValueError("Invalid Supervisor passed to SupervisorProcessState")
+
         self.config = config
+        self._supervisor = supervisor
+        self.exec = None
 
     def stop(self):
         logger.debug(f"Stopping process: {self.config.name}")
-        pass
+
+        # If there is no exec, then nothing to stop
+        if self.exec is None:
+            return
 
     def start(self):
         logger.debug(f"Starting process: {self.config.name}")
-        pass
+
+        # Nothing to do if there is already a thread processing this
+        if self.exec is not None:
+            return
+
+        self.exec = SupervisorProcessExec(self.config, self._supervisor._main_thread_condition)
 
     def restart(self):
         logger.debug(f"Restarting process: {self.config.name}")
-        pass
+
+        # TODO: Add functionality to support restarts via other means (e.g. call process, signal)
+        self.stop()
+        self.start()
 
 class SupervisorProcessConfig:
     def __init__(self, name, config, definition):
@@ -82,6 +152,8 @@ class SupervisorProcessConfig:
         # Extract environment vars
 
         # Extract shell
+        self.shell = obslib.extract_property(definition, "shell", optional=True, default=False)
+        self.shell = session.resolve(self.shell, bool)
 
         # Extract restart config
 
@@ -202,22 +274,32 @@ class Supervisor:
         if not isinstance(config_path, str) or config_path is None:
             raise ValueError("Invalid config path passed to Supervisor")
 
-        self.config_path = config_path
+        self._config_path = config_path
 
         # If the target is a directory, then read from spctrl.yaml
         # in that directory instead.
-        if os.path.isdir(self.config_path):
-            self.config_path = os.path.join(self.config_path, "spctrl.yaml")
+        if os.path.isdir(self._config_path):
+            self._config_path = os.path.join(self._config_path, "spctrl.yaml")
 
-        logger.debug(f"Using '{self.config_path}' for config path")
+        logger.debug(f"Using '{self._config_path}' for config path")
 
         # Load the initial configuration
-        self.config = SupervisorConfig(self.config_path)
-        self._should_reload_config = False
+        self._config = SupervisorConfig(self._config_path)
+
+        # Flag to finalise the supervisor
+        self._terminate = False
+
+        # Set up for the main thread running the supervisor
+        self._main_thread_condition = threading.Condition()
+        self._main_thread_ref = threading.Thread(target=Supervisor._main_thread, args=[self])
+        self._main_thread_ref.start()
 
     def reload_config(self):
-        # Clear the current config to force a reload
-        self._should_reload_config = True
+        logger.debug("Reloading configuration for Supervisor")
+        self._config = SupervisorConfig(self._config_path)
+
+        logger.debug("Notifying main thread")
+        self._main_thread_condition.notify()
 
     def _prune(self, config, states):
         # Find any process states that are now out of scope and stop them
@@ -233,13 +315,13 @@ class Supervisor:
 
             # Create a process state if it is missing
             if process_name not in states:
-                states[process_name] = SupervisorProcessState(config.processes[process_name])
+                states[process_name] = SupervisorProcessState(self, config.processes[process_name])
 
             # Check if the config for the process has changed
             if not states[process_name].config.is_equal(config.processes[process_name]):
                 # Stop the process and replace the state with a new state
                 states[process_name].stop()
-                states[process_name] = SupervisorProcessState(config.processes[process_name])
+                states[process_name] = SupervisorProcessState(self, config.processes[process_name])
 
             # The configs are either already the same or functionally identical at this point.
             # If the configs are only functionally identical, update it so that it
@@ -250,24 +332,25 @@ class Supervisor:
             # Start the process - ignored if the process is already running
             states[process_name].start()
 
-    def run(self):
+    def _main_thread(self):
         config = None
         states = dict()
 
+        self._main_thread_condition.acquire()
+
         while True:
-            # If the configuration is missing, reload it here
-            if self._should_reload_config:
-                self._should_reload_config = False
-                try:
-                    self.config = SupervisorConfig(self.config_path)
-                except Exception as e:
-                    logger.error("Error reloading configuration")
-                    logger.error(e)
+            # Finish up here is terminate has been set for the Supervisor
+            if self._terminate:
+                logger.debug("Main thread closing - Terminate requested")
+                for process_name in states:
+                    states[process_name].stop()
+
+                return
 
             # Call prune on out of scope processes, if there is a newer config
-            if self.config is not None and self.config != config:
+            if self._config is not None and self._config != config:
                 logger.debug("Running against new configuration")
-                config = self.config
+                config = self._config
                 try:
                     self._prune(config, states)
                 except Exception as e:
@@ -282,9 +365,23 @@ class Supervisor:
                     logger.error("Error running process loop")
                     logger.error(e)
 
-            # Restart process loop after 5 seconds
-            time.sleep(5)
+            # Wait for a notification
+            self._main_thread_condition.acquire()
+            ret = self._main_thread_condition.wait(timeout=15)
+
+            # Debugging for reason for waking main thread
+            if ret:
+                logger.debug("Main thread wake from notify")
+            else:
+                logger.debug("Main thread wake from wait timeout")
+
+    def wait(self):
+        self._main_thread_ref.join()
 
     def terminate(self):
-        pass
+        logger.debug("Setting terminate for Supervisor")
+        self._terminate = True
+
+        logger.debug("Notifying main thread")
+        self._main_thread_condition.notify()
 
