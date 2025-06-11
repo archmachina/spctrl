@@ -3,7 +3,7 @@ version: "2alpha"
 
 vars:
   github_owner: archmachina
-  github_repo: obslib
+  github_repo: spctrl
 
 include:
   - .bdast/common.yaml
