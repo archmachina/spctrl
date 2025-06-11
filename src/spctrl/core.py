@@ -30,27 +30,34 @@ class SupervisorProcessDeps:
         self.strict = obslib.coerce_value(self.strict, bool)
 
 class SupervisorProcessExec:
-    def __init__(self, config, condition):
+    def __init__(self, config, callback):
         if not isinstance(config, SupervisorProcessConfig):
             raise ValueError("Invalid SupervisorProcessConfig passed to SupervisorProcessExec")
 
-        if not isinstance(condition, threading.Condition):
-            raise ValueError("Invalid condition passed to SupervisorProcessExec")
+        if not callable(callback):
+            raise ValueError("Invalid callback passed to SupervisorProcessExec")
 
         self._config = config
+        self._callback = callback
 
         # State variables indicating state for the process being called
         self.finished = False
-        self.rc = None
         self.proc = None
 
         # Start the thread to execute the process
-        self._condition = condition
+        logger.debug(f"EXEC: {self._config.name}: Starting thread to start and monitor process")
         self._thread = threading.Thread(target=SupervisorProcessExec._exec, args=[self])
         self._thread.start()
 
     def _exec(self):
+        """
+        Spawn a separate process and wait for the process to complete.
+        The process state is saved in the instance for other threads to access
+        Note that this method is executed in a separate thread (created in __init__)
+        """
 
+        # If using shell, then leave it as a single string, otherwise Popen expects an array
+        # of arguments to define the process to be executed
         call = self._config.command
         if not self._config.shell:
             call = shlex.split(call)
@@ -65,17 +72,26 @@ class SupervisorProcessExec:
             "shell": self._config.shell
         }
 
-        proc = subprocess.Popen(call, **subprocess_args)
+        logger.debug(f"EXEC: {self._config.name}: Spawning process")
+        self.proc = subprocess.Popen(call, **subprocess_args)
 
-        self.proc = proc
-        self.rc = proc.returncode
+        # Wait for process
+        # self.proc can be accessed by a different thread at this point, while this thread is
+        # waiting for the process to complete
+        logger.debug(f"EXEC: {self._config.name}: Waiting for process with id {self.proc.pid}")
+        self.proc.wait()
+
+        # Mark finished for other threads to interrogate
+        logger.debug(f"EXEC: {self._config.name}: Process finished with return code {self.proc.returncode}")
         self.finished = True
 
-        self._condition.acquire()
-        self._condition.notify()
-        self._condition.release()
+        # Call the callback
+        self._callback()
 
     def terminate(self):
+        # TODO: Currently just SIGTERM and kill, but can interrogate the config for method to
+        # terminate the process in the future
+        logger.debug(f"EXEC: {self._config.name}: Terminating")
         proc.send_signal(signal.SIGTERM)
         time.sleep(10)
         proc.kill()
@@ -92,26 +108,38 @@ class SupervisorProcessState:
         self._supervisor = supervisor
         self.exec = None
 
-    def stop(self):
-        logger.debug(f"Stopping process: {self.config.name}")
+    def _callback(self):
+        # Use the condition defined for the main thread to notify it that an exec
+        # has completed
+        # Note - This is executed within the SupervisorProcessExec thread used to
+        # wait on a process
+        logger.debug("STATE: Notifying main thread")
+        self._supervisor.notify()
 
+    def stop(self):
         # If there is no exec, then nothing to stop
         if self.exec is None:
             return
 
-    def start(self):
-        logger.debug(f"Starting process: {self.config.name}")
-
-        # Nothing to do if there is already a thread processing this
-        if self.exec is not None:
+        # Check if the called process has finished
+        if self.exec.finished:
             return
 
-        self.exec = SupervisorProcessExec(self.config, self._supervisor._main_thread_condition)
+        # Process is still running, so terminate
+        logger.debug(f"STATE: Stopping process: {self.config.name}")
+        self.exec.terminate()
+
+    def start(self):
+        # Check if there is an existing exec and it is running
+        if self.exec is not None and not self.exec.finished:
+            return
+
+        logger.debug(f"STATE: Starting process: {self.config.name}")
+        self.exec = SupervisorProcessExec(self.config, self._callback)
 
     def restart(self):
-        logger.debug(f"Restarting process: {self.config.name}")
-
         # TODO: Add functionality to support restarts via other means (e.g. call process, signal)
+        logger.debug(f"STATE: Restarting process: {self.config.name}")
         self.stop()
         self.start()
 
@@ -299,7 +327,7 @@ class Supervisor:
         self._config = SupervisorConfig(self._config_path)
 
         logger.debug("Notifying main thread")
-        self._main_thread_condition.notify()
+        self.notify()
 
     def _prune(self, config, states):
         # Find any process states that are now out of scope and stop them
@@ -336,8 +364,6 @@ class Supervisor:
         config = None
         states = dict()
 
-        self._main_thread_condition.acquire()
-
         while True:
             # Finish up here is terminate has been set for the Supervisor
             if self._terminate:
@@ -345,6 +371,7 @@ class Supervisor:
                 for process_name in states:
                     states[process_name].stop()
 
+                logger.debug("Returning from _main_thread")
                 return
 
             # Call prune on out of scope processes, if there is a newer config
@@ -366,8 +393,10 @@ class Supervisor:
                     logger.error(e)
 
             # Wait for a notification
+            logger.debug("Main thread waiting...")
             self._main_thread_condition.acquire()
-            ret = self._main_thread_condition.wait(timeout=15)
+            ret = self._main_thread_condition.wait(timeout=60)
+            self._main_thread_condition.release()
 
             # Debugging for reason for waking main thread
             if ret:
@@ -378,10 +407,13 @@ class Supervisor:
     def wait(self):
         self._main_thread_ref.join()
 
-    def terminate(self):
-        logger.debug("Setting terminate for Supervisor")
-        self._terminate = True
-
-        logger.debug("Notifying main thread")
+    def notify(self):
+        self._main_thread_condition.acquire()
         self._main_thread_condition.notify()
+        self._main_thread_condition.release()
+
+    def terminate(self):
+        logger.debug("Setting terminate for Supervisor and notifying main thread")
+        self._terminate = True
+        self.notify()
 
