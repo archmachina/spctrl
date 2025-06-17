@@ -18,7 +18,7 @@ jobs:
           submodules: false
 
       - name: linting
-        uses: github/super-linter@v6
+        uses: github/super-linter@v7
         env:
           VALIDATE_ALL_CODEBASE: false
           DEFAULT_BRANCH: main
@@ -34,7 +34,14 @@ jobs:
         with:
           submodules: true
 
+      - name: python setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          cache: 'pip'
+
       - name: pr_branch_main
         shell: bash
         run: |
           ./entrypoint pr_branch_main
+
